@@ -1,0 +1,29 @@
+{
+  "name": "ia-chunks",
+  "fields": [
+    { "name": "id",            "type": "Edm.String", "key": true,  "filterable": true, "sortable": true },
+    { "name": "doc_id",        "type": "Edm.String", "filterable": true, "facetable": true, "retrievable": true },
+    { "name": "title",         "type": "Edm.String", "searchable": true, "analyzer": "ko.microsoft" },
+    { "name": "chunk",         "type": "Edm.String", "searchable": true, "analyzer": "ko.microsoft" },
+    { "name": "contentVector", "type": "Collection(Edm.Single)", "searchable": true,
+      "dimensions": 3072, "vectorSearchProfile": "default" },
+    { "name": "page",          "type": "Edm.Int32",  "filterable": true, "sortable": true, "retrievable": true },
+    { "name": "source_uri",    "type": "Edm.String", "retrievable": true },
+    { "name": "dept",          "type": "Edm.String", "filterable": true, "facetable": true, "retrievable": true },
+    { "name": "system",        "type": "Edm.String", "filterable": true, "facetable": true, "retrievable": true },
+    { "name": "year",          "type": "Edm.Int32",  "filterable": true, "facetable": true, "sortable": true, "retrievable": true }
+  ],
+  "vectorSearch": {
+    "profiles": [{ "name": "default", "algorithm": "hnsw" }],
+    "algorithms": [{ "name": "hnsw", "kind": "hnsw" }]
+  },
+  "semantic": {
+    "configurations": [{
+      "name": "default",
+      "prioritizedFields": {
+        "titleField":   { "fieldName": "title" },
+        "prioritizedContentFields":[ { "fieldName": "chunk" } ]
+      }
+    }]
+  }
+}
