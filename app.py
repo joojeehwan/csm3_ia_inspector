@@ -556,7 +556,8 @@ async def on_message(msg: cl.Message):
         if not (os.getenv("AZURE_EXISTING_AGENT_ID") or os.getenv("AZURE_AGENT_ID")):
             await cl.Message(content=(
                 "웹 검색 모드는 Azure OpenAI 에이전트가 필요합니다.\n"
-                "Azure OpenAI에서 에이전트를 만들고 Bing Search 연결을 추가한 뒤, .env에 AZURE_AGENT_ID=asst_...를 설정하세요."
+                "Azure AI Foundry(services.ai) 프로젝트에서 에이전트를 만들고 Bing Search 연결을 추가한 뒤, \n"
+                ".env에 AZURE_AGENT_ID=asst_...를 설정하세요. App Service에서는 시스템 할당 관리 ID(MSI)를 활성화하고 프로젝트에 권한을 부여하면 로그인 없이 동작합니다."
             )).send()
             return
         try:

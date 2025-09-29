@@ -49,7 +49,8 @@ def _format_snippets(hits: List[Dict[str, Any]]) -> str:
 
 def _route(state: State) -> str:
     mode = state.get("mode", "qa")
-    # ia_summary도 내부 검색을 사용
+    # web_qa는 LangGraph에서 처리하지 않고 app.py에서 직접 처리
+    # qa, ia_summary만 LangGraph로 처리
     return "retrieve_internal"
 
 
@@ -98,18 +99,11 @@ def build_graph():
         )
     sg = StateGraph(State)
     sg.add_node("retrieve_internal", _retrieve_internal)
-    # web_qa는 orchestrator에서 처리하지 않습니다 (Grounding 전용은 app.py에서)
     sg.add_node("make_prompt", _make_prompt)
     sg.add_node("generate", _generate)
 
-    # Route from START using a conditional router function
-    sg.add_conditional_edges(
-        START,
-        _route,
-        {
-            "retrieve_internal": "retrieve_internal",
-        },
-    )
+    # web_qa는 app.py에서 직접 처리하므로 LangGraph에서는 제외
+    sg.add_edge(START, "retrieve_internal")
     sg.add_edge("retrieve_internal", "make_prompt")
     sg.add_edge("make_prompt", "generate")
     sg.add_edge("generate", END)

@@ -60,8 +60,12 @@ def _get_ai_project_client():
             raise RuntimeError("AI Project 클라이언트는 services.ai.azure.com 엔드포인트에서만 사용됩니다.")
         if DefaultAzureCredential is None or AIProjectClient is None:
             raise RuntimeError("azure-identity, azure-ai-projects, azure-ai-agents 패키지를 설치하세요 (requirements.txt).")
-        # Use DefaultAzureCredential. User must be signed-in via az login/VS Code Account and have access.
-        cred = DefaultAzureCredential(exclude_interactive_browser_credential=False)
+        # Use DefaultAzureCredential. In App Service, prefer Managed Identity to avoid interactive login.
+        # Locally, az login / VS Code Account also work.
+        cred = DefaultAzureCredential(
+            exclude_interactive_browser_credential=True,
+            exclude_managed_identity_credential=False,
+        )
         _ai_project_client = AIProjectClient(credential=cred, endpoint=AOAI_ENDPOINT)
     return _ai_project_client
 
