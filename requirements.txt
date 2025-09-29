@@ -15,3 +15,8 @@ pytesseract==0.3.10
 langgraph
 pdfminer.six==20231228
 python-docx
+SQLAlchemy>=2.0
+aiosqlite>=0.20
+azure-identity>=1.17.0
+azure-ai-projects>=1.0.0b7
+azure-ai-agents>=1.0.0b5

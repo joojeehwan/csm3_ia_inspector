@@ -5,6 +5,7 @@ from openai import AzureOpenAI
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
 from pypdf import PdfReader
+import importlib
 try:
     from pdfminer.high_level import extract_text as _pdfminer_extract_text
     _HAS_PDFMINER = True
@@ -89,6 +90,7 @@ def _quality_score(t: str) -> float:
 
 def ingest_local():
     batch=[]
+    # 1) PDF
     for pdf in DATA_DIR.glob("*.pdf"):
         reader = PdfReader(str(pdf))
         full_text = ""
@@ -122,8 +124,59 @@ def ingest_local():
             })
         if len(batch) >= 500:
             search_chunks.upload_documents(batch); batch.clear()
-    if batch: search_chunks.upload_documents(batch)
-    print("✅ local ingest → ia-chunks complete")
+
+    # 2) DOCX (python-docx)
+    for docx_path in DATA_DIR.glob("*.docx"):
+        try:
+            docx_mod = importlib.import_module("docx")
+            _Docx = getattr(docx_mod, "Document")
+            doc = _Docx(str(docx_path))
+            paras = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
+            text = clean_text("\n\n".join(paras))
+        except Exception as e:
+            print(f"WARN: DOCX 읽기 실패: {docx_path.name} — {e}")
+            continue
+        parts = simple_chunks(text, 1200, 150)
+        if not parts: continue
+        vecs = embed_batch(parts)
+        for t, v in zip(parts, vecs):
+            batch.append({
+                "id": str(uuid.uuid4()),
+                "doc_id": docx_path.stem,
+                "title": docx_path.name,
+                "chunk": t,
+                "contentVector": v,
+                "source_uri": f"local://{docx_path.name}",
+            })
+        if len(batch) >= 500:
+            search_chunks.upload_documents(batch); batch.clear()
+
+    # 3) TXT
+    for txt in DATA_DIR.glob("*.txt"):
+        try:
+            text = Path(txt).read_text(encoding="utf-8", errors="ignore")
+            text = clean_text(text)
+        except Exception as e:
+            print(f"WARN: TXT 읽기 실패: {txt.name} — {e}")
+            continue
+        parts = simple_chunks(text, 1200, 150)
+        if not parts: continue
+        vecs = embed_batch(parts)
+        for t, v in zip(parts, vecs):
+            batch.append({
+                "id": str(uuid.uuid4()),
+                "doc_id": txt.stem,
+                "title": txt.name,
+                "chunk": t,
+                "contentVector": v,
+                "source_uri": f"local://{txt.name}",
+            })
+        if len(batch) >= 500:
+            search_chunks.upload_documents(batch); batch.clear()
+
+    if batch:
+        search_chunks.upload_documents(batch)
+    print("✅ local ingest (pdf/docx/txt) → ia-chunks complete")
 
 def ingest_from_raw(limit=500):
     docs = search_raw.search(search_text="*", top=limit, select=["id","content","metadata_storage_name","metadata_storage_path","page"])

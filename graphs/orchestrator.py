@@ -6,7 +6,6 @@ load_dotenv()
 
 from openai import AzureOpenAI
 from retrivers.internal_search import hybrid_search
-from retrivers.web_search import web_search
 from rag.prompst import QA_PROMPT, IA_SUMMARY_PROMPT, WEB_QA_PROMPT
 
 
@@ -50,8 +49,6 @@ def _format_snippets(hits: List[Dict[str, Any]]) -> str:
 
 def _route(state: State) -> str:
     mode = state.get("mode", "qa")
-    if mode == "web_qa":
-        return "retrieve_web"
     # ia_summary도 내부 검색을 사용
     return "retrieve_internal"
 
@@ -60,10 +57,6 @@ def _retrieve_internal(state: State) -> State:
     hits = hybrid_search(state["question"], top=8)
     return {"hits": hits}
 
-
-def _retrieve_web(state: State) -> State:
-    hits = web_search(state["question"], top=8)
-    return {"hits": hits}
 
 
 def _make_prompt(state: State) -> State:
@@ -98,20 +91,26 @@ def _generate(state: State) -> State:
 
 def build_graph():
     try:
-        from langgraph.graph import StateGraph, END  # type: ignore
+        from langgraph.graph import StateGraph, START, END  # type: ignore
     except Exception as e:
         raise RuntimeError(
             f"LangGraph를 사용할 수 없습니다. 패키지 설치 필요: pip install langgraph\n원인: {e}"
         )
     sg = StateGraph(State)
     sg.add_node("retrieve_internal", _retrieve_internal)
-    sg.add_node("retrieve_web", _retrieve_web)
+    # web_qa는 orchestrator에서 처리하지 않습니다 (Grounding 전용은 app.py에서)
     sg.add_node("make_prompt", _make_prompt)
     sg.add_node("generate", _generate)
 
-    sg.set_entry_point(_route)
+    # Route from START using a conditional router function
+    sg.add_conditional_edges(
+        START,
+        _route,
+        {
+            "retrieve_internal": "retrieve_internal",
+        },
+    )
     sg.add_edge("retrieve_internal", "make_prompt")
-    sg.add_edge("retrieve_web", "make_prompt")
     sg.add_edge("make_prompt", "generate")
     sg.add_edge("generate", END)
     return sg.compile()

@@ -73,7 +73,7 @@ topics = [
         "title": "검색 기반 RAG 아키텍처",
         "bullets": [
             "임베딩 + 하이브리드 검색",
-            "프롬프트에 근거 스니펫 주입",
+            "프롬프트에 근거 주입",
             "출처 표기 원칙",
         ],
         "images": ["RAG-Flow", "Index-Schema"],

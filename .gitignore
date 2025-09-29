@@ -1,4 +1,19 @@
-# Python
+.venv/
+__pycache__/
+*.pyc
+.env
+*.db
+chainlit.db*
+.azure/
+.DS_Store
+*.log
+logs/
+dist/
+build/
+node_modules/
+*.zip
+images/
+data/# Python
 __pycache__/
 *.py[cod]
 *.pyo

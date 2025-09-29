@@ -45,24 +45,49 @@ def hybrid_search(query: str, top: int = 8, filter: Optional[str] = None):
     emb = _embed(query)
     if _USE_NEW_VECTOR_API:
         vec = _VectorQuery(vector=emb, k=top, fields="contentVector")
-        res = search.search(
-            search_text=query,
-            vector_queries=[vec],
-            top=top,
-            filter=filter,
-            query_type="semantic",
-            semantic_configuration_name="default",
-            select=["id","doc_id","title","chunk","source_uri","page","dept","system","year"]
-        )
+        try:
+            res = search.search(
+                search_text=query,
+                vector_queries=[vec],
+                top=top,
+                filter=filter,
+                query_type="semantic",
+                semantic_configuration_name="default",
+                search_fields=["title","chunk"],
+                select=["id","doc_id","title","chunk","source_uri","page","dept","system","year"],
+            )
+        except Exception:
+            # Fallback when semantic ranker/config is not available
+            res = search.search(
+                search_text=query,
+                vector_queries=[vec],
+                top=top,
+                filter=filter,
+                query_type="simple",
+                search_fields=["title","chunk"],
+                select=["id","doc_id","title","chunk","source_uri","page","dept","system","year"],
+            )
     else:
         vec = _VectorQuery(value=emb, k_nearest_neighbors=top, fields="contentVector")
-        res = search.search(
-            search_text=query,
-            vectors=[vec],
-            top=top,
-            filter=filter,
-            query_type="semantic",
-            semantic_configuration_name="default",
-            select=["id","doc_id","title","chunk","source_uri","page","dept","system","year"]
-        )
+        try:
+            res = search.search(
+                search_text=query,
+                vectors=[vec],
+                top=top,
+                filter=filter,
+                query_type="semantic",
+                semantic_configuration_name="default",
+                search_fields=["title","chunk"],
+                select=["id","doc_id","title","chunk","source_uri","page","dept","system","year"],
+            )
+        except Exception:
+            res = search.search(
+                search_text=query,
+                vectors=[vec],
+                top=top,
+                filter=filter,
+                query_type="simple",
+                search_fields=["title","chunk"],
+                select=["id","doc_id","title","chunk","source_uri","page","dept","system","year"],
+            )
     return [r for r in res]
