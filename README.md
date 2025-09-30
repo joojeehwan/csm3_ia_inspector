@@ -332,6 +332,29 @@ python -m chainlit run app.py -w
 
 ---
 
+## 🧩 VS Code 확장(추천)
+
+Azure 배포/운영을 VS Code에서 편하게 하기 위한 확장 목록입니다.
+
+- Azure Tools (Extension Pack) — ms-vscode.vscode-azureextensionpack
+	- App Service, Storage, Resources, Account 등 주요 Azure 확장을 일괄 설치
+- Azure App Service — ms-azuretools.vscode-azureappservice
+	- “Deploy to Web App…”, 구성 편집, 로그 스트리밍, SSH/콘솔 등
+- Azure Storage — ms-azuretools.vscode-azurestorage
+	- Blob 컨테이너 탐색/업로드, SAS 생성, 파일 브라우저
+- Azure Resources — ms-azuretools.vscode-azureresourcegroups
+	- 구독/리소스 그룹/리소스 트리 보기 및 빠른 액션
+- Azure Account — ms-vscode.azure-account
+	- VS Code에서 Azure 로그인/구독 선택
+- Azure Developer CLI (azd) — ms-azuretools.vscode-azd (선택)
+	- IaC+앱 통합 배포 파이프라인 구성 시 유용
+
+개발 일반
+- Python — ms-python.python, Pylance — ms-python.vscode-pylance
+- Docker — ms-azuretools.vscode-docker (컨테이너 빌드/실행/퍼블리시)
+
+---
+
 ## 🛠️ 트러블슈팅
 
 - chainlit 명령을 찾을 수 없음 → `python -m chainlit run app.py -w`
