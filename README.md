@@ -18,7 +18,7 @@ python -m chainlit run app.py -w
 
 - 브라우저 열고 설정 패널 확인
 
-말하기 포인트: “내부 문서 RAG + 요약 + 보안형 원본열람(SAS) + 웹검색(옵션) 지원합니다.”
+말하기 포인트: “내부 문서 RAG + 요약 + 웹검색(옵션) 지원합니다.”
 
 ### 1) 명령어 소개(20초)
 
@@ -108,8 +108,7 @@ Azure AI Search + Azure OpenAI로 내부 문서를 검색(RAG)하고, Chainlit U
 
 - ✅ 문서 업로드(PDF, DOCX, TXT) → 청크/임베딩/색인
 - 🔎 RAG 검색 답변(출처 표 포함) + IA 요약 모드
-- 🌐 (선택) 웹 검색 모드: Azure OpenAI Agents 기반 출처 인용
-- 🔐 Blob 저장소(SAS 링크) 원본 열람, 퍼블릭 차단 환경 지원
+- 🌐 웹 검색 모드: Azure OpenAI Agents 기반 출처 인용
 - 🛡️ 환각 방지: 무검색/저연관 시 답변·근거 표시 억제 가이드 출력
 - 🧭 업로드 목록 페이지네이션 + 최신 3건 빠른 상세 보기 버튼
 - 🧱 Chainlit 데이터 레이어·인증(선택)로 세션 히스토리 보관
@@ -120,7 +119,7 @@ Azure AI Search + Azure OpenAI로 내부 문서를 검색(RAG)하고, Chainlit U
 
 ```bash
 .
-├── app.py                     # Chainlit 엔트리; 업로드·검색·요약·가드·SAS 처리
+├── app.py                     # Chainlit 엔트리; 업로드·검색·요약·가드
 ├── rag/
 │   └── prompst.py            # QA/요약/웹QA 프롬프트(요약 전용으로 수정됨)
 ├── retrivers/
@@ -250,8 +249,6 @@ BLOB_CONTAINER=ia-source
 
 ```
 
-> 히스토리 사이드바는 “지속 저장(Data Layer) + 인증”이 모두 활성화되어야 표시됩니다.
-
 ---
 
 ## 🧩 설치
@@ -290,12 +287,12 @@ python -m chainlit run app.py -w
 ```
 
 접속 후 설정에서 모드를 선택하세요.
-- qa: 내부 문서 RAG 검색
-- ia_summary: 내부 근거 요약(요약만 출력)
-- web_qa: Azure OpenAI Agents 기반 웹 검색(에이전트 ID 필요)
+- IA 검색: 내부 문서 RAG 검색
+- IA 요약: 내부 근거 요약(요약만 출력)
+- 웹 검색: Azure OpenAI Agents 기반 웹 검색(에이전트 ID 필요)
 
 슬래시 명령
-- /업로드, /uploads, /history, /보기 N, /기록시각화, /help(또는 /)
+- /업로드, /업로드목록, /기록, /보기 N, /기록시각화, /help(또는 /)
 
 ---
 
@@ -333,7 +330,6 @@ Azure 배포/운영을 VS Code에서 편하게 하기 위한 확장 목록입니
 
 개발 일반
 - Python — ms-python.python, Pylance — ms-python.vscode-pylance
-- Docker — ms-azuretools.vscode-docker (컨테이너 빌드/실행/퍼블리시)
 
 ---
 
