@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# Use minimal flags for broad shell compatibility on App Service
+set -e
 
 # Azure App Service sets PORT
 : "${PORT:=8000}"

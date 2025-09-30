@@ -43,19 +43,38 @@ def _embed(q: str) -> List[float]:
 
 def hybrid_search(query: str, top: int = 8, filter: Optional[str] = None):
     emb = _embed(query)
+    # Use a larger vector neighborhood for better recall, but return only `top` docs
+    vec_k = max(top * 3, 20)
     if _USE_NEW_VECTOR_API:
-        vec = _VectorQuery(vector=emb, k=top, fields="contentVector")
+        vec = _VectorQuery(vector=emb, k=vec_k, fields="contentVector")
         try:
-            res = search.search(
-                search_text=query,
-                vector_queries=[vec],
-                top=top,
-                filter=filter,
-                query_type="semantic",
-                semantic_configuration_name="default",
-                search_fields=["title","chunk"],
-                select=["id","doc_id","title","chunk","source_uri","page","dept","system","year"],
-            )
+            # Prefer semantic with stricter term matching for precision
+            try:
+                res = search.search(
+                    search_text=query,
+                    vector_queries=[vec],
+                    top=top,
+                    filter=filter,
+                    query_type="semantic",
+                    semantic_configuration_name="default",
+                    search_mode="all",
+                    query_language="ko-kr",
+                    search_fields=["title","chunk"],
+                    select=["id","doc_id","title","chunk","source_uri","page","dept","system","year"],
+                )
+            except TypeError:
+                # Older SDKs may not support query_language
+                res = search.search(
+                    search_text=query,
+                    vector_queries=[vec],
+                    top=top,
+                    filter=filter,
+                    query_type="semantic",
+                    semantic_configuration_name="default",
+                    search_mode="all",
+                    search_fields=["title","chunk"],
+                    select=["id","doc_id","title","chunk","source_uri","page","dept","system","year"],
+                )
         except Exception:
             # Fallback when semantic ranker/config is not available
             res = search.search(
@@ -64,22 +83,38 @@ def hybrid_search(query: str, top: int = 8, filter: Optional[str] = None):
                 top=top,
                 filter=filter,
                 query_type="simple",
+                search_mode="all",
                 search_fields=["title","chunk"],
                 select=["id","doc_id","title","chunk","source_uri","page","dept","system","year"],
             )
     else:
-        vec = _VectorQuery(value=emb, k_nearest_neighbors=top, fields="contentVector")
+        vec = _VectorQuery(value=emb, k_nearest_neighbors=vec_k, fields="contentVector")
         try:
-            res = search.search(
-                search_text=query,
-                vectors=[vec],
-                top=top,
-                filter=filter,
-                query_type="semantic",
-                semantic_configuration_name="default",
-                search_fields=["title","chunk"],
-                select=["id","doc_id","title","chunk","source_uri","page","dept","system","year"],
-            )
+            try:
+                res = search.search(
+                    search_text=query,
+                    vectors=[vec],
+                    top=top,
+                    filter=filter,
+                    query_type="semantic",
+                    semantic_configuration_name="default",
+                    search_mode="all",
+                    query_language="ko-kr",
+                    search_fields=["title","chunk"],
+                    select=["id","doc_id","title","chunk","source_uri","page","dept","system","year"],
+                )
+            except TypeError:
+                res = search.search(
+                    search_text=query,
+                    vectors=[vec],
+                    top=top,
+                    filter=filter,
+                    query_type="semantic",
+                    semantic_configuration_name="default",
+                    search_mode="all",
+                    search_fields=["title","chunk"],
+                    select=["id","doc_id","title","chunk","source_uri","page","dept","system","year"],
+                )
         except Exception:
             res = search.search(
                 search_text=query,
@@ -87,6 +122,7 @@ def hybrid_search(query: str, top: int = 8, filter: Optional[str] = None):
                 top=top,
                 filter=filter,
                 query_type="simple",
+                search_mode="all",
                 search_fields=["title","chunk"],
                 select=["id","doc_id","title","chunk","source_uri","page","dept","system","year"],
             )

@@ -1,6 +1,7 @@
 import chainlit as cl
 import os
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 from openai import AzureOpenAI
@@ -14,6 +15,8 @@ from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
 from ingest.build_chunks import simple_chunks, embed_batch
 from urllib.parse import urlparse
+from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
+from azure.identity import DefaultAzureCredential
 
 USE_LANGGRAPH = os.getenv("USE_LANGGRAPH", "false").lower() in ("1", "true", "yes")
 _LG_AVAILABLE = False
@@ -104,6 +107,54 @@ def _env_int(name: str, default: int) -> int:
 
 SNIPPET_PREVIEW_CHARS = _env_int("SNIPPET_PREVIEW_CHARS", 400)
 
+
+def _uploads_page_size() -> int:
+    # Page size for uploads list; defaults to 10
+    return _env_int("UPLOADS_PAGE_SIZE", 10)
+
+
+async def _send_uploads_list(page: int = 0):
+    uploads = cl.user_session.get("uploads", [])
+    if not uploads:
+        await cl.Message(content="업로드 이력이 없습니다.").send();
+        return
+    n = len(uploads)
+    ps = _uploads_page_size()
+    # Newest first: build reversed indices
+    rev_indices = list(range(n - 1, -1, -1))
+    total_pages = max(1, (n + ps - 1) // ps)
+    page = max(0, min(page, total_pages - 1))
+    start = page * ps
+    end = min(len(rev_indices), start + ps)
+    view_indices = rev_indices[start:end]
+
+    # Header
+    lines = [f"업로드 문서 목록 (총 {n}개) — 페이지 {page+1}/{total_pages}"]
+    for disp_i, idx in enumerate(view_indices, start=1):
+        u = uploads[idx]
+        # Use page-local numbering like "1)" to avoid Markdown auto-lists
+        lines.append(f" {disp_i}) {u.get('title')} — {u.get('ts','')}")
+    lines.append("")
+    lines.append("상세 보기: 가장 최신 3 개 항목만 버튼으로 제공됩니다.")
+
+    # Detail actions for latest 3 overall
+    actions = []
+    latest_count = min(3, n)
+    for k in range(latest_count):
+        latest_idx = n - 1 - k
+        title = uploads[latest_idx].get("title") or f"업로드 {latest_idx+1}"
+        actions.append(cl.Action(name="show_upload", value=str(latest_idx), description=f"최근 {k+1}번: {title}"))
+
+    # Pagination actions
+    if page > 0:
+        actions.append(cl.Action(name="uploads_page_prev", value=str(page-1), description="이전 페이지"))
+    if page < total_pages - 1:
+        actions.append(cl.Action(name="uploads_page_next", value=str(page+1), description="다음 페이지"))
+
+    # Remember page in session
+    cl.user_session.set("uploads_page", page)
+    await cl.Message(content="\n".join(lines), actions=actions).send()
+
 def _preview_text(text: str, n: int = None) -> str:
     if n is None:
         n = SNIPPET_PREVIEW_CHARS
@@ -111,17 +162,31 @@ def _preview_text(text: str, n: int = None) -> str:
         return ""
     return text if len(text) <= n else (text[:n] + "…")
 
+def _strip_inline_source_markers(text: str) -> str:
+    """Remove inline citation tokens like 【3:0†source】 that can appear in agent answers."""
+    if not text:
+        return text
+    try:
+        cleaned = re.sub(r"【[^】]*?source】", "", text, flags=re.IGNORECASE)
+        # Collapse excessive spaces/newlines
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+    except Exception:
+        return text
+
 """In-chat history panel features removed for a cleaner UI."""
 
 def _format_snippets(hits):
     rows = []
     for h in hits:
         title = h.get("title", "")
-        page = h.get("page")
-        uri = h.get("source_uri", "")
         chunk = (_preview_text(h.get("chunk", ""), 500)).replace("\n", " ")
-        page_part = f" p.{page}" if page not in (None, "") else ""
-        rows.append(f"- {title}{page_part}: {chunk} [src: {uri}]")
+        # Keep prompt context clean: exclude raw source refs and page indicators
+        if title:
+            rows.append(f"- {title}: {chunk}")
+        else:
+            rows.append(f"- {chunk}")
     return "\n".join(rows)
 
 
@@ -149,17 +214,74 @@ def _format_source_for_table(uri: str) -> str:
         return uri
 
 
-def _hits_table_markdown(hits: List[dict], max_rows: int = 5, preview_chars: int = 140):
-    rows = ["| # | 제목 | p. | 출처 | 미리보기 |", "|:-:|:--|:-:|:--|:--|"]
-    action_map = []  # list of (label, rid)
-    for i, h in enumerate(hits[:max_rows], start=1):
-        title = (h.get("title") or "(제목없음)").replace("|", " ")
-        page = h.get("page")
-        rid = str(h.get("id") or os.urandom(8).hex())
-        src = _format_source_for_table(h.get("source_uri", ""))
-        preview = _preview_text(h.get("chunk", ""), preview_chars).replace("\n", " ")
-        rows.append(f"| {i} | {title} | {page or '-'} | {src} | {preview} |")
-        action_map.append((f"전체 보기 #{i}", rid))
+def _highlight(text: str, query: str) -> str:
+    if not text or not query:
+        return text or ""
+    try:
+        # naive token highlight on words >= 2 chars
+        toks = [t for t in set(query.replace("\n"," ").split()) if len(t) >= 2]
+        out = text
+        for t in sorted(toks, key=len, reverse=True):
+            out = re.sub(re.escape(t), f"**{t}**", out, flags=re.IGNORECASE)
+        return out
+    except Exception:
+        return text
+
+def _query_tokens(q: str) -> List[str]:
+    if not q:
+        return []
+    try:
+        # Extract words and Korean blocks; drop very short tokens
+        toks = re.findall(r"[\w가-힣]+", q, flags=re.IGNORECASE)
+        toks = [t.lower() for t in toks if len(t) >= 2 and not t.startswith('/')]
+        # de-dup while preserving length-based relevance
+        return sorted(set(toks), key=len, reverse=True)
+    except Exception:
+        return [t for t in (q or '').split() if len(t) >= 2]
+
+def _is_relevant_hits(hits: List[dict], query: str, k: int = 3) -> bool:
+    """Heuristic guard: require token overlap in at least 2 of the top-k hits.
+    Returns True if >= 2 hits contain any query token.
+    """
+    toks = _query_tokens(query)
+    if not toks:
+        return False
+    k = max(1, k)
+    match_hits = 0
+    for h in hits[:k]:
+        title = (h.get('title') or '').lower()
+        chunk = (h.get('chunk') or '').lower()
+        blob = f"{title}\n{chunk}"
+        if any(t in blob for t in toks):
+            match_hits += 1
+    return match_hits >= 2 or (match_hits >= 1 and k == 1)
+
+
+def _group_hits_by_doc(hits: List[dict]) -> List[dict]:
+    groups: Dict[str, dict] = {}
+    order: List[str] = []
+    for h in hits:
+        key = h.get("doc_id") or (h.get("source_uri") or h.get("title") or os.urandom(4).hex())
+        if key not in groups:
+            groups[key] = {"title": h.get("title") or "(제목없음)", "source_uri": h.get("source_uri",""), "items": []}
+            order.append(key)
+        groups[key]["items"].append(h)
+    return [groups[k] for k in order]
+
+
+def _hits_table_markdown(hits: List[dict], max_rows: int = 5, preview_chars: int = 140, query: str = ""):
+    # Group by document; show one line per doc with first snippet preview
+    groups = _group_hits_by_doc(hits)
+    rows = ["| # | 제목 | 출처 | 미리보기 |", "|:-:|:--|:--|:--|"]
+    action_map = []
+    for i, g in enumerate(groups[:max_rows], start=1):
+        title = (g.get("title") or "(제목없음)").replace("|"," ")
+        src = _format_source_for_table(g.get("source_uri",""))
+        first = g.get("items", [{}])[0]
+        preview = _preview_text(first.get("chunk",""), preview_chars).replace("\n"," ")
+        preview = _highlight(preview, query)
+        rows.append(f"| {i} | {title} | {src} | {preview} |")
+        action_map.append((f"전체 보기 #{i}", str(first.get("id") or os.urandom(8).hex())))
     return "\n".join(rows), action_map
 
 
@@ -174,8 +296,7 @@ def _render_log_entry(idx: int, entry: dict) -> str:
         lines.append("(근거 없음)")
     else:
         for i, h in enumerate(hits[:10], start=1):
-            page_part = f" p.{h.get('page')}" if h.get('page') not in (None, "") else ""
-            lines.append(f"  {i}. {h.get('title','')} {page_part} — {h.get('source_uri','')}")
+            lines.append(f"  {i}. {h.get('title','')} — {h.get('source_uri','')}")
     return "\n".join(lines)
 
 
@@ -203,6 +324,234 @@ def _read_docx(path: str) -> str:
     paras = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
     return "\n\n".join(paras)
 
+
+# ===== Azure Blob helpers =====
+def _get_blob_container_client():
+    """Create a Blob container client using either connection string or MSI.
+
+    Env options:
+    - BLOB_CONNECTION_STRING + BLOB_CONTAINER (default: ia-source)
+    - or STORAGE_ACCOUNT_URL (e.g., https://<account>.blob.core.windows.net) + BLOB_CONTAINER with DefaultAzureCredential
+    Returns (client, container_url) or (None, None) if not configured.
+    """
+    try:
+        container = os.getenv("BLOB_CONTAINER", "ia-source")
+        conn = os.getenv("BLOB_CONNECTION_STRING")
+        if conn:
+            svc = BlobServiceClient.from_connection_string(conn)
+            client = svc.get_container_client(container)
+            try:
+                client.create_container()
+            except Exception:
+                pass
+            return client, client.url
+        # MSI / Workload identity path
+        acct_url = os.getenv("STORAGE_ACCOUNT_URL")  # https://<acct>.blob.core.windows.net
+        if acct_url:
+            cred = DefaultAzureCredential(exclude_interactive_browser_credential=True)
+            svc = BlobServiceClient(account_url=acct_url, credential=cred)
+            client = svc.get_container_client(container)
+            try:
+                client.create_container()
+            except Exception:
+                pass
+            return client, client.url
+    except Exception:
+        return None, None
+    return None, None
+
+
+def _upload_to_blob(local_path: str, dest_name: str) -> str | None:
+    """Upload a local file to the configured Blob container. Returns https://… URL or None on failure."""
+    client, container_url = _get_blob_container_client()
+    if not client:
+        return None
+    try:
+        with open(local_path, "rb") as f:
+            client.upload_blob(name=dest_name, data=f, overwrite=True)
+        # Try to build a temporary read-only SAS URL so private containers can still be opened
+        try:
+            sas_url = _build_blob_sas_url(client, dest_name)
+            if sas_url:
+                return sas_url
+            # If SAS cannot be built, avoid exposing non-SAS URL
+            return None
+        except Exception:
+            # Any error building SAS: do not return plain URL
+            return None
+    except Exception:
+        return None
+
+
+def _build_blob_sas_url(container_client, blob_name: str) -> str | None:
+    """Create a read-only SAS URL for the given blob.
+    Prefers account key from connection string; if not available, uses user delegation key with MSI.
+    Expiry defaults to 1 hour and can be tuned via BLOB_SAS_TTL_MIN (minutes).
+    """
+    try:
+        # Determine expiry
+        ttl_min = 60
+        try:
+            ttl_min = int(os.getenv("BLOB_SAS_TTL_MIN", "60") or 60)
+        except Exception:
+            ttl_min = 60
+        expiry = datetime.utcnow() + timedelta(minutes=max(5, ttl_min))
+
+        # Service/client basics
+        container_name = container_client.container_name  # type: ignore[attr-defined]
+        base_url = container_client.url.rstrip("/")
+
+        # Try account-key SAS path (connection string)
+        account_name = getattr(container_client, "account_name", None)
+        account_key = None
+        # Preferred: read from env connection string directly (always available if that path used)
+        conn_str = os.getenv("BLOB_CONNECTION_STRING")
+        if conn_str and "AccountKey=" in conn_str:
+            try:
+                parts = dict([tuple(p.split("=", 1)) for p in conn_str.split(";") if "=" in p])
+                account_name = parts.get("AccountName", account_name)
+                account_key = parts.get("AccountKey")
+            except Exception:
+                account_key = None
+        # Fallback attempt: introspect service client credential
+        service_client = None
+        if not account_key:
+            try:
+                service_client = container_client._get_service_client()  # type: ignore[attr-defined]
+                account_key = getattr(getattr(service_client, "credential", None), "account_key", None)
+            except Exception:
+                service_client = None
+        if account_name and account_key:
+            sas = generate_blob_sas(
+                account_name=account_name,
+                container_name=container_name,
+                blob_name=blob_name,
+                permission=BlobSasPermissions(read=True),
+                expiry=expiry,
+            )
+            return f"{base_url}/{blob_name}?{sas}"
+
+        # If no account key (MSI path), use user delegation key
+        try:
+            if service_client is None:
+                service_client = container_client._get_service_client()  # type: ignore[attr-defined]
+        except Exception:
+            # Fallback: reconstruct from account URL (container URL is like https://acct.blob.core.windows.net/container)
+            m = re.match(r"^(https://[^/]+)/", base_url + "/")
+            account_url = m.group(1) if m else None
+            if not account_url:
+                return None
+            service_client = BlobServiceClient(account_url=account_url, credential=DefaultAzureCredential(exclude_interactive_browser_credential=True))
+
+        udk = service_client.get_user_delegation_key(starts_on=datetime.utcnow() - timedelta(minutes=1), expires_on=expiry)
+        sas = generate_blob_sas(
+            account_name=service_client.account_name,
+            container_name=container_name,
+            blob_name=blob_name,
+            permission=BlobSasPermissions(read=True),
+            expiry=expiry,
+            user_delegation_key=udk
+        )
+        return f"{base_url}/{blob_name}?{sas}"
+    except Exception:
+        return None
+
+
+# ===== IA history visualization helpers =====
+def _hist_build_df(history: list):
+    import pandas as pd  # type: ignore
+    from urllib.parse import urlparse as _u
+    rows = []
+    for e in history:
+        try:
+            ts = e.get("ts")
+            ts_dt = pd.to_datetime(ts, errors="coerce")
+            mode = e.get("mode") or "-"
+            q = (e.get("question") or "").strip()
+            filt = e.get("filter") or None
+            hits = e.get("hits") or []
+            domains = []
+            doc_titles = []
+            doc_keys = []
+            for h in hits:
+                uri = h.get("source_uri") or ""
+                try:
+                    if uri.startswith("upload://"):
+                        dom = "upload"
+                    else:
+                        dom = _u(uri).netloc or "-"
+                except Exception:
+                    dom = "-"
+                domains.append(dom)
+                # document key/title
+                title = (h.get("title") or "").strip()
+                key = uri or title or "-"
+                if title:
+                    doc_titles.append(title)
+                else:
+                    doc_titles.append(key)
+                doc_keys.append(key)
+            rows.append({
+                "ts": ts_dt,
+                "date": ts_dt.date() if pd.notnull(ts_dt) else None,
+                "mode": mode,
+                "question": q,
+                "filter": filt,
+                "hit_count": len(hits),
+                "domains": ",".join(sorted(set(domains))) if domains else "-",
+                "doc_titles": "|".join(sorted(set(doc_titles))) if doc_titles else "-",
+                "doc_keys": "|".join(sorted(set(doc_keys))) if doc_keys else "-",
+            })
+        except Exception:
+            continue
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.dropna(subset=["ts"]).sort_values("ts")
+    return df
+
+
+"""Date range helper removed (no time filters)."""
+
+
+async def _hist_render_dashboard(df, title_suffix=""):
+    import pandas as pd  # type: ignore
+    import plotly.express as px  # type: ignore
+    dff = df.copy()
+    title = f"📜 IA 검색 히스토리 리포트 {title_suffix}"
+    await cl.Message(content=title).send()
+    # Top documents (by appearance in hits)
+    if not dff.empty and (dff["doc_titles"] != "-").any():
+        doc_rows = []
+        for ds in dff["doc_titles"].fillna(""):
+            for t in str(ds).split("|"):
+                t = t.strip()
+                if t:
+                    doc_rows.append(t)
+        if doc_rows:
+            ddf = pd.DataFrame({"document": doc_rows})
+            dtop = ddf["document"].value_counts().head(15).reset_index()
+            dtop.columns = ["document", "count"]
+            fig_docs = px.bar(dtop, x="document", y="count", title="자주 참조된 문서 Top 15")
+            await cl.Message(elements=[cl.Plotly(name="Top 문서", figure=fig_docs)], content="").send()
+
+    # Main topics: frequent terms from questions
+    if not dff.empty:
+        terms = []
+        for q in dff["question"].fillna(""):
+            for t in str(q).split():
+                t = t.strip()
+                if len(t) >= 2 and not t.startswith("/"):
+                    terms.append(t.lower())
+        if terms:
+            tdf = pd.DataFrame({"term": terms})
+            ttop = tdf["term"].value_counts().head(20).reset_index()
+            ttop.columns = ["term", "count"]
+            fig_terms = px.bar(ttop, x="term", y="count", title="주된 키워드 Top 20")
+            await cl.Message(elements=[cl.Plotly(name="Top 키워드", figure=fig_terms)], content="").send()
+
+    # Raw 로그 표 제거됨
+
+    # CSV 다운로드 제거됨
 
 async def _summarize_and_keywords(text: str) -> Dict[str, Any]:
     sample = text[:6000]  # token 보호를 위해 길이 제한
@@ -239,7 +588,8 @@ def _recommend_similar(doc_id: str, top: int = 5):
 
 
 def _upsert_chunks(doc_id: str, title: str, source_uri: str, text: str, system: str = "upload") -> int:
-    parts = simple_chunks(text, 1200, 150)
+    # Tuned chunk size/overlap for better precision
+    parts = simple_chunks(text, 900, 220)
     if not parts:
         return 0
     vecs = embed_batch(parts)
@@ -276,13 +626,12 @@ async def start():
     cl.user_session.set("settings", settings)
     cl.user_session.set("history", [])
     cl.user_session.set("uploads", [])
-    # Initialize forced filter (used by use_filter/clear_filter actions)
-    cl.user_session.set("forced_filter", None)
     # Minimal intro message without panel references
     await cl.Message(content=(
         "질문을 입력하면 검색과 요약을 수행합니다.\n"
         "- /업로드 : 문서 업로드 및 분석\n- /업로드목록 : 업로드 목록\n"
-        "- /기록 : 최근 검색 목록\n- /보기 N : N번째 검색 로그\n- /대시보드 : 간단 통계"
+        "- /기록시각화 : IA 검색 히스토리 시각화\n"
+        "- /기록 : 최근 검색 목록\n- /보기 N : N번째 검색 로그"
     )).send()
 
 @cl.on_settings_update
@@ -300,73 +649,74 @@ def _normalize_command(text: str) -> str:
         return ""
     head = t.split()[0].lower()
     ko_map = {
+        "/": "help",
+        "/도움말": "help",
         "/업로드": "upload",
         "/업로드목록": "uploads",
         "/기록": "history",
         "/보기": "show",
-        "/대시보드": "dashboard",
-        "/통계": "dashboard",
+    # CSV viz removed
+    "/기록시각화": "viz_history",
     }
     en_map = {
+        "/help": "help",
         "/upload": "upload",
         "/uploads": "uploads",
         "/history": "history",
-        "/show": "show",
-        "/dashboard": "dashboard",
+    "/show": "show",
+    # CSV viz removed
+    "/viz-history": "viz_history",
+    "/history-viz": "viz_history",
     }
     return ko_map.get(head) or en_map.get(head) or ""
+
+def _help_text() -> str:
+    return (
+        "사용 가능한 명령:\n"
+        "- /업로드 : 문서 업로드 및 분석\n"
+        "- /업로드목록 : 업로드 목록\n"
+        "- /기록 : 최근 검색 목록\n"
+        "- /보기 N : N번째 검색 로그 보기 (예: /보기 2)\n"
+        "- /기록시각화 : IA 검색 히스토리 시각화\n"
+    )
 
 @cl.on_message
 async def on_message(msg: cl.Message):
     # quick commands to inspect history (Korean aliases supported)
     cmd = _normalize_command(msg.content)
-    if cmd == "history":
+    if cmd == "help":
+        await cl.Message(content=_help_text()).send(); return
+    # IA search history visualization
+    if cmd == "viz_history":
         history = cl.user_session.get("history", [])
         if not history:
+            await cl.Message(content="시각화할 히스토리가 없습니다.").send(); return
+        try:
+            import pandas as pd  # type: ignore
+            import plotly.express as px  # type: ignore
+        except Exception as e:
+            await cl.Message(content=f"시각화 라이브러리 누락: {e}. requirements.txt 설치 후 다시 시도하세요.").send(); return
+        df = _hist_build_df(history)
+        cl.user_session.set("hist_df", df)
+        await _hist_render_dashboard(df, title_suffix="")
+        return
+    # If it looks like a slash command but unknown, don't search
+    if (msg.content or "").strip().startswith("/") and not cmd:
+        await cl.Message(content=_help_text()).send()
+        return
+    if cmd == "history":
+        hist_list = cl.user_session.get("history", [])
+        if not hist_list:
             await cl.Message(content="히스토리가 비어있습니다.").send()
         else:
             parts = ["세션 히스토리 (최근 5개):"]
-            for i, e in list(enumerate(history))[-5:]:
+            for i, e in list(enumerate(hist_list))[-5:]:
                 parts.append(f" - {i+1}) [{e.get('mode')}] {e.get('question')}")
             parts.append("\n자세히 보려면 '/보기 N' 을 입력하세요 (예: /보기 2)")
             await cl.Message(content="\n".join(parts)).send()
         return
-    if cmd == "dashboard":
-        uploads = cl.user_session.get("uploads", [])
-        n_docs = len(uploads)
-        n_chunks = sum(u.get("chunks", 0) for u in uploads)
-        all_tags = []
-        for u in uploads:
-            all_tags.extend(u.get("hashtags", []))
-        tag_counts = {}
-        for t in all_tags:
-            tag_counts[t] = tag_counts.get(t, 0) + 1
-        top_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-        ck_total = sum(len(u.get("checklist", [])) for u in uploads)
-        ck_done = sum(sum(1 for c in u.get("checklist", []) if c.get("done")) for u in uploads)
-        rate = (ck_done / ck_total * 100) if ck_total else 0
-        lines = [
-            "📊 분석 대시보드",
-            f"- 업로드 문서 수: {n_docs}",
-            f"- 인덱싱된 청크 수: {n_chunks}",
-            f"- 체크리스트 완료율: {ck_done}/{ck_total} ({rate:.0f}%)",
-        ]
-        if top_tags:
-            lines.append("- 상위 키워드: " + ", ".join([f"{k}×{v}" for k, v in top_tags]))
-        await cl.Message(content="\n".join(lines)).send()
-        return
     if cmd == "uploads":
-        uploads = cl.user_session.get("uploads", [])
-        if not uploads:
-            await cl.Message(content="업로드 이력이 없습니다.").send(); return
-        lines = ["업로드 문서 목록:"]
-        for i, u in enumerate(uploads, start=1):
-            lines.append(f" {i}. {u.get('title')} — {u.get('ts','')}")
-        lines.append("\n문서 상세는 아래 버튼을 사용하세요.")
-        await cl.Message(
-            content="\n".join(lines),
-            actions=[cl.Action(name="show_upload", value="last", description="최근 업로드 보기")]
-        ).send()
+        await _send_uploads_list(page=cl.user_session.get("uploads_page", 0) or 0)
         return
     if cmd == "upload":
         files = await cl.AskFileMessage(
@@ -394,7 +744,14 @@ async def on_message(msg: cl.Message):
                 await cl.Message(content=f"파일 읽기 실패: {name} — {e}").send(); continue
 
             doc_id = Path(name).stem + "-" + os.urandom(3).hex()
-            source_uri = f"upload://{name}"
+            # Upload original file to Blob if configured; fall back to upload:// pseudo URI
+            blob_url = None
+            try:
+                safe_name = f"uploads/{doc_id}{ext}"
+                blob_url = _upload_to_blob(path, safe_name)
+            except Exception:
+                blob_url = None
+            source_uri = blob_url or f"upload://{name}"
             try:
                 n_chunks = _upsert_chunks(doc_id, name, source_uri, text, system="upload")
             except Exception as e:
@@ -410,26 +767,6 @@ async def on_message(msg: cl.Message):
             sim = _recommend_similar(doc_id, top=5)
             sim_safe = _sanitize_hits_for_log(sim)
 
-            # basic checklist from summary
-            checklist: List[Dict[str, Any]] = []
-            ck_prompt = (
-                "다음 문서를 기반으로 검토해야 할 체크리스트 항목 6개를 간단한 한 줄로 제안해 주세요. 각 항목은 하이픈(-)으로 시작하세요.\n\n"
-                + (sk.get("summary") or text[:1000])
-            )
-            try:
-                ck_resp = client.chat.completions.create(
-                    model=CHAT_DEPLOY,
-                    messages=[{"role":"system","content":"Generate checklist."},{"role":"user","content":ck_prompt}],
-                    temperature=0.1
-                )
-                ck_text = ck_resp.choices[0].message.content
-                for line in (ck_text or "").splitlines():
-                    t = line.strip().lstrip("-•").strip()
-                    if t:
-                        checklist.append({"text": t, "done": False})
-                checklist = checklist[:10]
-            except Exception:
-                pass
 
             # save upload record
             uploads = cl.user_session.get("uploads", [])
@@ -440,7 +777,7 @@ async def on_message(msg: cl.Message):
                 "summary": sk.get("summary",""),
                 "hashtags": sk.get("hashtags", []),
                 "similar": sim_safe,
-                # "checklist": checklist,
+                "blob_url": blob_url,
                 "ts": datetime.utcnow().isoformat(timespec='seconds') + 'Z'
             }
             uploads.append(rec)
@@ -458,11 +795,12 @@ async def on_message(msg: cl.Message):
                 "키워드:",
                 (" ".join(rec["hashtags"]) or "(없음)"),
             ]
+            if blob_url:
+                lines.append(f"\n원본 파일: [열기]({blob_url})")
             if rec["similar"]:
                 lines.append("\n유사 문서:")
                 for i, h in enumerate(rec["similar"][:5], start=1):
-                    page_part = f" p.{h.get('page')}" if h.get('page') not in (None, "") else ""
-                    lines.append(f"  {i}. {h.get('title','')} {page_part} — {h.get('source_uri','')}")
+                    lines.append(f"  {i}. {h.get('title','')} — {h.get('source_uri','')}")
             idx = len(uploads) - 1
             await cl.Message(
                 content="\n".join(lines),
@@ -493,9 +831,6 @@ async def on_message(msg: cl.Message):
     filter_parts = []
     if settings.get("filter"):
         filter_parts.append(settings.get("filter"))
-    forced = cl.user_session.get("forced_filter")
-    if forced:
-        filter_parts.append(forced)
     filter_str = " and ".join([f"({p})" for p in filter_parts]) or None
     show_log = bool(settings.get("show_log", False))
     await cl.Message(content=f"🔎 검색 중… ({mode_label})").send()
@@ -510,23 +845,49 @@ async def on_message(msg: cl.Message):
         else:
             _lg = True
         if _LG_AVAILABLE and '_lg' in locals() and _lg:
-            await cl.Message(content=answer).send()
-            if hits:
-                # cache last hits for full-view actions
-                last_hits_map = {}
-                for h in hits:
-                    rid = h.get("id") or os.urandom(8).hex()
-                    last_hits_map[str(rid)] = h
-                cl.user_session.set("last_hits_map", last_hits_map)
+            # Guard: if no hits, or hits irrelevant, avoid answering
+            if not hits:
+                await cl.Message(content="📭 관련 근거를 찾지 못했습니다.\n- 검색어를 바꾸거나 필터를 조정해 보세요.").send()
+                # log empty and return
+                history = cl.user_session.get("history", [])
+                history.append({
+                    "mode": MODE_LABELS.get(mode, mode),
+                    "question": msg.content,
+                    "filter": filter_str,
+                    "hits": [],
+                    "ts": datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+                })
+                cl.user_session.set("history", history)
+                if show_log:
+                    await cl.Message(content=_render_log_entry(len(history)-1, history[-1])).send()
+                return
+            _relevant = _is_relevant_hits(hits, msg.content)
+            if not _relevant:
+                tips = [
+                    "질문과 근거의 관련성이 낮습니다.",
+                    "- 질문에 문서의 핵심 키워드나 용어를 더 포함해 보세요.",
+                    "- 다른 표현(동의어)로도 시도해 보세요.",
+                ]
+                # 오프토픽: 근거 표시는 하지 않습니다.
+                await cl.Message(content="\n".join(tips)).send()
+            else:
+                await cl.Message(content=answer).send()
+                if hits:
+                    # cache last hits for full-view actions
+                    last_hits_map = {}
+                    for h in hits:
+                        rid = h.get("id") or os.urandom(8).hex()
+                        last_hits_map[str(rid)] = h
+                    cl.user_session.set("last_hits_map", last_hits_map)
 
-                md, actions = _hits_table_markdown(hits)
-                await cl.Message(content="**근거 (상위 5)**\n\n" + md).send()
-                # Cache for snippet opens
-                last_hits_map = {}
-                for h in hits[:5]:
-                    rid = str(h.get("id") or os.urandom(8).hex())
-                    last_hits_map[rid] = h
-                cl.user_session.set("last_hits_map", last_hits_map)
+                    md, actions = _hits_table_markdown(hits, query=msg.content)
+                    await cl.Message(content="**근거 (상위 5)**\n\n" + md).send()
+                    # Cache for snippet opens
+                    last_hits_map = {}
+                    for h in hits[:5]:
+                        rid = str(h.get("id") or os.urandom(8).hex())
+                        last_hits_map[rid] = h
+                    cl.user_session.set("last_hits_map", last_hits_map)
                 # Snippet action buttons removed per request – table only
             # log history and provide quick actions
             history = cl.user_session.get("history", [])
@@ -541,14 +902,6 @@ async def on_message(msg: cl.Message):
             idx = len(history) - 1
             if show_log:
                 await cl.Message(content=_render_log_entry(idx, history[idx])).send()
-            else:
-                await cl.Message(
-                    content="로그 액션",
-                    actions=[
-                        cl.Action(name="show_log", value=str(idx), description="이번 검색 로그 보기"),
-                        cl.Action(name="show_history", value="all", description="세션 히스토리 보기"),
-                    ],
-                ).send()
             return
 
     if mode == "web_qa":
@@ -562,6 +915,7 @@ async def on_message(msg: cl.Message):
             return
         try:
             answer, sources = ask_via_agent_with_sources(msg.content)
+            answer = _strip_inline_source_markers(answer)
             await cl.Message(content=answer).send()
             hits = []
             if sources:
@@ -604,14 +958,6 @@ async def on_message(msg: cl.Message):
             idx = len(history) - 1
             if show_log:
                 await cl.Message(content=_render_log_entry(idx, history[idx])).send()
-            else:
-                await cl.Message(
-                    content="로그 보기",
-                    actions=[
-                        cl.Action(name="show_log", value=str(idx), description="이번 검색 로그 보기"),
-                        cl.Action(name="show_history", value="all", description="세션 히스토리 보기"),
-                    ],
-                ).send()
             return
         except Exception as e:
             await cl.Message(content=f"에이전트(웹 검색) 호출 실패: {e}").send()
@@ -624,8 +970,6 @@ async def on_message(msg: cl.Message):
                 "📭 관련 근거를 찾지 못했습니다.",
                 "- 검색어를 바꾸거나 필터를 조정해 보세요.",
             ]
-            if cl.user_session.get("forced_filter"):
-                msg_lines.append("- 현재 문서 한정 필터가 적용되어 있습니다. '문서 한정 해제' 버튼으로 해제하세요.")
             await cl.Message(content="\n".join(msg_lines)).send()
 
             # save to history with empty hits
@@ -641,16 +985,29 @@ async def on_message(msg: cl.Message):
             idx = len(history) - 1
             if show_log:
                 await cl.Message(content=_render_log_entry(idx, history[idx])).send()
-            else:
-                await cl.Message(
-                    content="로그 보기",
-                    actions=[
-                        cl.Action(name="show_log", value=str(idx), description="이번 검색 로그 보기"),
-                        cl.Action(name="show_history", value="all", description="세션 히스토리 보기"),
-                    ],
-                ).send()
             return
-        # Build prompt only when hits exist
+        # Build prompt only when hits exist AND look relevant
+        if not _is_relevant_hits(hits, msg.content):
+            # 오프토픽: LLM 호출도, 근거 표시도 하지 않음. 가이드만 출력.
+            tips = [
+                "질문과 근거의 관련성이 낮습니다.",
+                "- 질문에 문서의 핵심 키워드나 용어를 더 포함해 보세요.",
+                "- 다른 표현(동의어)로도 시도해 보세요.",
+            ]
+            await cl.Message(content="\n".join(tips)).send()
+            # save to history and return
+            history = cl.user_session.get("history", [])
+            history.append({
+                "mode": MODE_LABELS.get(mode, mode),
+                "question": msg.content,
+                "filter": filter_str,
+                "hits": _sanitize_hits_for_log(hits),
+                "ts": datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+            })
+            cl.user_session.set("history", history)
+            if show_log:
+                await cl.Message(content=_render_log_entry(len(history)-1, history[-1])).send()
+            return
         snippets = _format_snippets(hits)
         prompt = (IA_SUMMARY_PROMPT if mode=="ia_summary" else QA_PROMPT).format(
             question=msg.content, snippets=snippets
@@ -669,7 +1026,7 @@ async def on_message(msg: cl.Message):
 
     if hits:
         # cache and compact evidence rendering
-        md, actions = _hits_table_markdown(hits)
+        md, actions = _hits_table_markdown(hits, query=msg.content)
         await cl.Message(content="**근거 (상위 5)**\n\n" + md).send()
         last_hits_map = {}
         for h in hits[:5]:
@@ -691,14 +1048,6 @@ async def on_message(msg: cl.Message):
     idx = len(history) - 1
     if show_log:
         await cl.Message(content=_render_log_entry(idx, history[idx])).send()
-    else:
-        await cl.Message(
-            content="로그 보기",
-            actions=[
-                cl.Action(name="show_log", value=str(idx), description="이번 검색 로그 보기"),
-                cl.Action(name="show_history", value="all", description="세션 히스토리 보기"),
-            ],
-        ).send()
     # No in-chat panel refresh (feature removed)
 
 
@@ -757,37 +1106,33 @@ async def show_upload(action):
         "키워드:",
         (" ".join(u.get("hashtags", [])) or "(없음)"),
     ]
+    if u.get("blob_url"):
+        lines.append(f"\n원본 파일: [열기]({u.get('blob_url')})")
     if u.get("similar"):
         lines.append("\n유사 문서:")
         for i, h in enumerate(u["similar"][:5], start=1):
-            page_part = f" p.{h.get('page')}" if h.get('page') not in (None, "") else ""
-            lines.append(f"  {i}. {h.get('title','')} {page_part} — {h.get('source_uri','')}")
-    ck = u.get("checklist", [])
-    if ck:
-        done = sum(1 for c in ck if c.get("done"))
-        lines.append(f"\n체크리스트 ({done}/{len(ck)} 완료):")
-        for i, c in enumerate(ck, start=1):
-            lines.append(f"  [{'x' if c.get('done') else ' '}] {i}. {c.get('text')}")
+            lines.append(f"  {i}. {h.get('title','')} — {h.get('source_uri','')}")
     await cl.Message(
-        content="\n".join(lines),
-    actions=[
-        cl.Action(name="use_filter", value=u.get("doc_id",""), description="이 문서로 검색 한정"),
-        cl.Action(name="clear_filter", value="", description="문서 한정 해제"),
-    ],
+        content="\n".join(lines)
     ).send()
 
 
-@cl.action_callback("use_filter")
-async def use_filter(action):
-    doc_id = str(action.value or "").strip()
-    if not doc_id:
-        await cl.Message(content="doc_id가 비어있습니다.").send(); return
-    filt = f"doc_id eq '{doc_id}'"
-    cl.user_session.set("forced_filter", filt)
-    await cl.Message(content=f"필터 적용됨: {filt}").send()
+"""Document-limit actions removed."""
 
 
-@cl.action_callback("clear_filter")
-async def clear_filter(action):
-    cl.user_session.set("forced_filter", None)
-    await cl.Message(content="문서 한정 필터가 해제되었습니다.").send()
+@cl.action_callback("uploads_page_prev")
+async def uploads_page_prev(action):
+    try:
+        page = int(action.value)
+    except Exception:
+        page = max(0, (cl.user_session.get("uploads_page", 0) or 0) - 1)
+    await _send_uploads_list(page=page)
+
+
+@cl.action_callback("uploads_page_next")
+async def uploads_page_next(action):
+    try:
+        page = int(action.value)
+    except Exception:
+        page = (cl.user_session.get("uploads_page", 0) or 0) + 1
+    await _send_uploads_list(page=page)

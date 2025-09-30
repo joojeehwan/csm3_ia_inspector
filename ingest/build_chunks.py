@@ -54,7 +54,7 @@ def clean_text(text: str) -> str:
     return t
 
 
-def simple_chunks(text: str, max_len=1200, overlap=150):
+def simple_chunks(text: str, max_len=900, overlap=220):
     paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
     out, buf = [], ""
     for p in paras:

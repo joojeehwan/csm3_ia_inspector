@@ -10,8 +10,6 @@ azure-storage-blob==12.23.1
 pypdf==5.0.1
 requests==2.32.3
 reportlab==4.2.5
-Pillow==10.4.0
-pytesseract==0.3.10
 langgraph
 pdfminer.six==20231228
 python-docx
@@ -20,3 +18,5 @@ aiosqlite>=0.20
 azure-identity>=1.17.0
 azure-ai-projects>=1.0.0b7
 azure-ai-agents>=1.0.0b5
+pandas>=2.0
+plotly>=5.22
