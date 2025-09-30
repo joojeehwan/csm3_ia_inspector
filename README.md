@@ -240,31 +240,14 @@ AZURE_AGENT_ID=asst_...
 # 이미 존재하는 에이전트 ID를 쓸 경우
 # AZURE_EXISTING_AGENT_ID=asst_...
 
-# (선택) Bing Search 클라이언트(독립 스크립트용)
-BING_SEARCH_ENDPOINT=https://api.bing.microsoft.com/v7.0/search
-BING_SEARCH_KEY=<your-bing-key>
-
 # 데이터/옵션
 DATA_DIR=./data
-USE_LANGGRAPH=false
+USE_LANGGRAPH=true
 
 # 업로드 원본 저장(둘 중 하나 경로 사용)
 BLOB_CONNECTION_STRING=DefaultEndpointsProtocol=...;AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net
 BLOB_CONTAINER=ia-source
-# 또는 관리 ID/워크로드 자격 증명 경로
-# STORAGE_ACCOUNT_URL=https://<account>.blob.core.windows.net
-# BLOB_CONTAINER=ia-source
-# SAS 만료(분)
-BLOB_SAS_TTL_MIN=60
 
-# (선택) Chainlit 데이터 레이어/인증(히스토리 보관용)
-DATABASE_URL=sqlite+aiosqlite:///./chainlit.db
-# chainlit create-secret 로 생성
-CHAINLIT_AUTH_SECRET=changeme-dev-secret
-CHAINLIT_USERNAME=admin
-CHAINLIT_PASSWORD=admin
-# 개발 편의 자동 인증(선택)
-# CHAINLIT_AUTO_USER=guest
 ```
 
 > 히스토리 사이드바는 “지속 저장(Data Layer) + 인증”이 모두 활성화되어야 표시됩니다.
